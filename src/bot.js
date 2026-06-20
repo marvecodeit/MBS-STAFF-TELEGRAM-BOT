@@ -204,21 +204,39 @@ bot.catch(err => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Health-check HTTP server (required by Render Web Service)
+// HTTP server — webhook receiver + health check
 // ─────────────────────────────────────────────────────────────────────────────
 
 const http = require('http');
-const PORT = process.env.PORT || 3000;
+const { webhookCallback } = require('grammy');
 
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('OK');
-}).listen(PORT, () => console.log(`Health check server listening on port ${PORT}`));
+const PORT         = process.env.PORT || 3000;
+const WEBHOOK_URL  = process.env.WEBHOOK_URL || 'https://mbs-staff-telegram-bot-1.onrender.com';
+const WEBHOOK_PATH = '/webhook';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Start bot (long polling)
-// ─────────────────────────────────────────────────────────────────────────────
+const handleUpdate = webhookCallback(bot, 'http');
 
-bot.start({
-  onStart: info => console.log(`✅ Bot running as @${info.username}`),
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'POST' && req.url === WEBHOOK_PATH) {
+    try {
+      await handleUpdate(req, res);
+    } catch (err) {
+      console.error('Webhook error:', err.message);
+      res.writeHead(500).end();
+    }
+  } else {
+    // Health check for all other routes
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('MBS Bot is running ✅');
+  }
+});
+
+server.listen(PORT, async () => {
+  console.log(`Server listening on port ${PORT}`);
+  try {
+    await bot.api.setWebhook(`${WEBHOOK_URL}${WEBHOOK_PATH}`);
+    console.log(`✅ Webhook set → ${WEBHOOK_URL}${WEBHOOK_PATH}`);
+  } catch (err) {
+    console.error('Failed to set webhook:', err.message);
+  }
 });
