@@ -1,0 +1,8 @@
+# Ignore all node_modules folders
+node_modules/
+
+# Optional common ignores
+.env
+dist/
+build/
+coverage/
