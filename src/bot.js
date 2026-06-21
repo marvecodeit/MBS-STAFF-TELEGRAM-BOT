@@ -1,6 +1,7 @@
 require('dotenv').config();
 
-const { Bot, session } = require('grammy');
+const http = require('http');
+const { Bot, session, webhookCallback } = require('grammy');
 
 const { handleStart, handleEmail, handlePassword, STAFF_ROLES } = require('./handlers/auth');
 const {
@@ -13,17 +14,25 @@ const { startPaymentReport, onTermSelectedForPayment } = require('./handlers/pay
 const { mainMenuTeacher, mainMenuStaff } = require('./keyboards/menus');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Bot bootstrap
+// Config
 // ─────────────────────────────────────────────────────────────────────────────
 
-if (!process.env.BOT_TOKEN) {
-  console.error('BOT_TOKEN is not set in .env');
+const BOT_TOKEN   = process.env.BOT_TOKEN;
+const PORT        = process.env.PORT || 3000;
+const WEBHOOK_URL = (process.env.WEBHOOK_URL || 'https://mbs-staff-telegram-bot-1.onrender.com').replace(/\/$/, '');
+const WEBHOOK_PATH = '/webhook';
+
+if (!BOT_TOKEN) {
+  console.error('❌ BOT_TOKEN is not set');
   process.exit(1);
 }
 
-const bot = new Bot(process.env.BOT_TOKEN);
+// ─────────────────────────────────────────────────────────────────────────────
+// Bot instance
+// ─────────────────────────────────────────────────────────────────────────────
 
-// In-memory session storage (per chat)
+const bot = new Bot(BOT_TOKEN);
+
 bot.use(session({
   initial: () => ({
     token: null, role: null, user: null,
@@ -40,7 +49,8 @@ bot.use(session({
 // Commands
 // ─────────────────────────────────────────────────────────────────────────────
 
-bot.command('start',  handleStart);
+bot.command('start', handleStart);
+
 bot.command('logout', async ctx => {
   ctx.session = { token: null, role: null, user: null, state: 'AWAIT_EMAIL' };
   await ctx.reply('👋 Logged out. Send /start to log in again.');
@@ -65,7 +75,6 @@ bot.command('menu', async ctx => {
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data;
 
-  // ── Navigation ─────────────────────────────────────────────────────────────
   if (data === 'action:cancel') {
     ctx.session.state = 'IDLE';
     await ctx.answerCallbackQuery('Cancelled');
@@ -96,38 +105,35 @@ bot.on('callback_query:data', async ctx => {
     return;
   }
 
-  // ── Teacher actions ────────────────────────────────────────────────────────
+  // Teacher actions
   if (data === 'action:template') { await ctx.answerCallbackQuery(); return startTemplate(ctx); }
   if (data === 'action:upload')   { await ctx.answerCallbackQuery(); return startUpload(ctx); }
   if (data === 'action:classes')  { await ctx.answerCallbackQuery(); return showMyClasses(ctx); }
 
-  // ── Staff / payment actions ────────────────────────────────────────────────
+  // Staff / payment actions
   if (data === 'action:payment:paid')   { await ctx.answerCallbackQuery(); return startPaymentReport(ctx, 'paid'); }
   if (data === 'action:payment:unpaid') { await ctx.answerCallbackQuery(); return startPaymentReport(ctx, 'unpaid'); }
   if (data === 'action:payment:full')   { await ctx.answerCallbackQuery(); return startPaymentReport(ctx, 'full'); }
 
-  // ── Class selection ────────────────────────────────────────────────────────
+  // Class selection
   if (data.startsWith('class:')) {
     const [, classId, ...rest] = data.split(':');
-    const className = rest.join(':'); // rejoin in case name had colons
+    const className = rest.join(':');
     return onClassSelected(ctx, classId, className);
   }
 
-  // ── Session selection ──────────────────────────────────────────────────────
+  // Session selection
   if (data.startsWith('sess:')) {
-    const sess = data.slice('sess:'.length);
-    return onSessionSelected(ctx, sess);
+    return onSessionSelected(ctx, data.slice('sess:'.length));
   }
 
-  // ── Term selection ─────────────────────────────────────────────────────────
+  // Term selection — route by state first, fall back to _pendingAction
   if (data.startsWith('term:')) {
     const term  = data.slice('term:'.length);
     const state = ctx.session.state;
-    // Route by state — more reliable than _pendingAction across async hops
     if (state === 'TEMPLATE_SELECT_TERM') return onTermSelectedForTemplate(ctx, term);
     if (state === 'UPLOAD_SELECT_TERM')   return onTermSelectedForUpload(ctx, term);
     if (state === 'PAYMENT_SELECT_TERM')  return onTermSelectedForPayment(ctx, term);
-    // Fallback: use _pendingAction if state wasn't set properly
     const action = ctx.session._pendingAction;
     if (action === 'template') return onTermSelectedForTemplate(ctx, term);
     if (action === 'upload')   return onTermSelectedForUpload(ctx, term);
@@ -136,56 +142,34 @@ bot.on('callback_query:data', async ctx => {
     return;
   }
 
-  // ── Upload method selection ────────────────────────────────────────────────
+  // Upload method selection
   if (data.startsWith('upload:')) {
-    const method = data.slice('upload:'.length); // 'file' | 'link'
-    return onUploadMethodSelected(ctx, method);
+    return onUploadMethodSelected(ctx, data.slice('upload:'.length));
   }
 
   await ctx.answerCallbackQuery('Unknown action');
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Message router — drives the multi-step conversation state machine
+// Message router
 // ─────────────────────────────────────────────────────────────────────────────
 
 bot.on('message', async ctx => {
   const state = ctx.session?.state || 'IDLE';
 
-  // ── Auth states ────────────────────────────────────────────────────────────
-  if (state === 'AWAIT_EMAIL' && ctx.message.text) {
-    return handleEmail(ctx);
-  }
+  if (state === 'AWAIT_EMAIL'    && ctx.message.text)     return handleEmail(ctx);
+  if (state === 'AWAIT_PASSWORD' && ctx.message.text)     return handlePassword(ctx);
+  if (state === 'AWAIT_EXCEL_FILE' && ctx.message.document) return handleExcelFile(ctx);
+  if (state === 'AWAIT_EXCEL_FILE' && ctx.message.text)   return ctx.reply('Please send the Excel file (.xlsx). Use /menu to cancel.');
+  if (state === 'AWAIT_SHEETS_LINK' && ctx.message.text)  return handleSheetsLink(ctx);
 
-  if (state === 'AWAIT_PASSWORD' && ctx.message.text) {
-    return handlePassword(ctx);
-  }
-
-  // ── Upload via Excel file ──────────────────────────────────────────────────
-  if (state === 'AWAIT_EXCEL_FILE' && ctx.message.document) {
-    return handleExcelFile(ctx);
-  }
-
-  // Received text instead of file
-  if (state === 'AWAIT_EXCEL_FILE' && ctx.message.text) {
-    return ctx.reply('Please send the Excel file (.xlsx). Use /menu to cancel.');
-  }
-
-  // ── Upload via Google Sheets link ──────────────────────────────────────────
-  if (state === 'AWAIT_SHEETS_LINK' && ctx.message.text) {
-    return handleSheetsLink(ctx);
-  }
-
-  // ── Catch-all for idle users ───────────────────────────────────────────────
   if (!ctx.session?.token) {
     ctx.session.state = 'AWAIT_EMAIL';
     return ctx.reply('Please send your email to log in:');
   }
 
-  // Already logged in — show menu
   const role = ctx.session.role;
   const menu = role === 'teacher' ? mainMenuTeacher : STAFF_ROLES.has(role) ? mainMenuStaff : null;
-
   if (menu) {
     await ctx.reply('Use the menu below or type /menu:', { reply_markup: menu });
   } else {
@@ -199,44 +183,60 @@ bot.on('message', async ctx => {
 
 bot.catch(err => {
   const ctx = err.ctx;
-  console.error(`Error handling update ${ctx?.update?.update_id}:`, err.error);
+  console.error(`[Grammy] Update ${ctx?.update?.update_id} error:`, err.error);
   ctx?.reply('⚠️ Something went wrong. Please try again or use /menu.').catch(() => {});
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HTTP server — webhook receiver + health check
+// Webhook registration helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-const http = require('http');
-const { webhookCallback } = require('grammy');
+async function registerWebhook() {
+  const url = `${WEBHOOK_URL}${WEBHOOK_PATH}`;
+  try {
+    await bot.api.setWebhook(url, {
+      drop_pending_updates: true,
+      allowed_updates: ['message', 'callback_query'],
+    });
+    console.log(`✅ Webhook registered → ${url}`);
+  } catch (err) {
+    console.error(`❌ setWebhook failed: ${err.message}`);
+  }
+}
 
-const PORT         = process.env.PORT || 3000;
-const WEBHOOK_URL  = process.env.WEBHOOK_URL || 'https://mbs-staff-telegram-bot-1.onrender.com';
-const WEBHOOK_PATH = '/webhook';
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP server — handles webhook POST + health checks
+// ─────────────────────────────────────────────────────────────────────────────
 
 const handleUpdate = webhookCallback(bot, 'http');
 
 const server = http.createServer(async (req, res) => {
+  // Telegram sends updates here
   if (req.method === 'POST' && req.url === WEBHOOK_PATH) {
     try {
       await handleUpdate(req, res);
     } catch (err) {
-      console.error('Webhook error:', err.message);
-      res.writeHead(500).end();
+      console.error('Webhook handler error:', err.message);
+      res.writeHead(500).end('Internal Server Error');
     }
-  } else {
-    // Health check for all other routes
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('MBS Bot is running ✅');
+    return;
   }
+
+  // Manual webhook re-registration (visit in browser if bot stops responding)
+  if (req.url === '/set-webhook') {
+    await registerWebhook();
+    const info = await bot.api.getWebhookInfo().catch(e => ({ url: 'error: ' + e.message }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, webhook: info }));
+    return;
+  }
+
+  // Health check
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('MBS Bot is running ✅');
 });
 
 server.listen(PORT, async () => {
-  console.log(`Server listening on port ${PORT}`);
-  try {
-    await bot.api.setWebhook(`${WEBHOOK_URL}${WEBHOOK_PATH}`);
-    console.log(`✅ Webhook set → ${WEBHOOK_URL}${WEBHOOK_PATH}`);
-  } catch (err) {
-    console.error('Failed to set webhook:', err.message);
-  }
+  console.log(`🚀 Server listening on port ${PORT}`);
+  await registerWebhook();
 });

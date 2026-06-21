@@ -59,6 +59,30 @@ async function getAllStudents(token, classId) {
   return data.students || [];
 }
 
+/**
+ * Search students by name, reg number, or email.
+ * @param {string} q        - search term (min 1 char)
+ * @param {string} classId  - optional class filter
+ * @param {number} limit    - max results (default 20)
+ */
+async function searchStudents(token, q, classId, limit = 20) {
+  const params = { q, limit };
+  if (classId) params.classId = classId;
+  const { data } = await axios.get(`${BASE()}/api/admin/students/search`, {
+    headers: headers(token),
+    params,
+  });
+  return data.students || [];
+}
+
+/** Get a single student's full details by MongoDB _id */
+async function getStudentById(token, studentId) {
+  const { data } = await axios.get(`${BASE()}/api/admin/students/${studentId}`, {
+    headers: headers(token),
+  });
+  return data.student;
+}
+
 // ── Results ───────────────────────────────────────────────────────────────────
 
 /**
@@ -101,6 +125,8 @@ module.exports = {
   getMyClasses,
   getClassStudents,
   getAllStudents,
+  searchStudents,
+  getStudentById,
   uploadResults,
   getPaidStudents,
 };
